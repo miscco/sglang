@@ -854,15 +854,14 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     const auto abs_max = warp::reduce_max(local_max);
     const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
     const auto inv_scale = 1.0f / scale;
-    // 4 fp8 / lane as two fp8x2 bit patterns
-    uint16_t result[2] = {
-        std::bit_cast<uint16_t>(pack_fp8(data[0] * inv_scale, data[1] * inv_scale)),
-        std::bit_cast<uint16_t>(pack_fp8(data[2] * inv_scale, data[3] * inv_scale))};
+    // 4 fp8 / lane
+    fp8x2_e4m3_t result[2] = {
+        pack_fp8(data[0] * inv_scale, data[1] * inv_scale), pack_fp8(data[2] * inv_scale, data[3] * inv_scale)};
 
     // q_fp8 row pointer: 128 fp8 / row, 4 per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
-    cub::WarpStore<uint16_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-        reinterpret_cast<uint16_t*>(out_row), result);
+    cub::WarpStore<fp8x2_e4m3_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+        reinterpret_cast<fp8x2_e4m3_t*>(out_row), result);
     params.weights_out[work_id] = weight_val * params.weight_scale * scale;
   }
 }

@@ -148,14 +148,12 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   if constexpr (kHadamard) dsa_indexer::hadamard_128(data, lane_id);
 
   {
-    // CUB only vectorizes stores of builtin types, so store the DType bit patterns
-    uint16_t out[kVecSize];
+    DType out[kVecSize];
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i)
-      out[i] = std::bit_cast<uint16_t>(cast<DType>(data[i]));
+      out[i] = cast<DType>(data[i]);
     auto out_row = static_cast<DType*>(params.k_out) + work_id * kHeadDim;
-    cub::WarpStore<uint16_t, kVecSize, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-        reinterpret_cast<uint16_t*>(out_row), out);
+    cub::WarpStore<DType, kVecSize, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(out_row, out);
   }
 }
 
@@ -357,12 +355,11 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto value_ptr = page_ptr + offset * kHeadDim;
   const auto scale_ptr = page_ptr + (kHeadDim << kPageBits) + offset * 4;
 
-  // 4 fp8 / lane as two fp8x2 bit patterns
-  uint16_t result[2] = {
-      std::bit_cast<uint16_t>(pack_fp8(data[0] * inv_scale, data[1] * inv_scale)),
-      std::bit_cast<uint16_t>(pack_fp8(data[2] * inv_scale, data[3] * inv_scale))};
-  cub::WarpStore<uint16_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-      reinterpret_cast<uint16_t*>(value_ptr), result);
+  // 4 fp8 / lane
+  fp8x2_e4m3_t result[2] = {
+      pack_fp8(data[0] * inv_scale, data[1] * inv_scale), pack_fp8(data[2] * inv_scale, data[3] * inv_scale)};
+  cub::WarpStore<fp8x2_e4m3_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr), result);
   if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
 }
 

@@ -13,7 +13,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <bit>
 #include <cstdint>
 
 namespace sglang {
@@ -55,9 +54,8 @@ __global__ __launch_bounds__(1024, 2) void  //
 
   const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
 
-  // Toolkit CUB's vectorized blocked load does not take a pointer to const
   bf16x2_t in[kVecElems / 2];
-  cub::LoadDirectBlockedVectorized(tid, const_cast<bf16x2_t*>(reinterpret_cast<const bf16x2_t*>(token_in)), in);
+  cub::LoadDirectBlockedVectorized(tid, reinterpret_cast<const bf16x2_t*>(token_in), in);
   float local_max = 0.0f;
   float vals[kVecElems];
 #pragma unroll
@@ -75,11 +73,10 @@ __global__ __launch_bounds__(1024, 2) void  //
   const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
   const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
 
-  // CUB only vectorizes stores of builtin types, so store the fp8x2 bit patterns
-  uint16_t out[kVecElems / 2];
+  fp8x2_e4m3_t out[kVecElems / 2];
 #pragma unroll
   for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-    out[i] = std::bit_cast<uint16_t>(pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale));
+    out[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
   }
 
   // Read this token's kTopK destinations once (fully unrolled).
@@ -103,7 +100,7 @@ __global__ __launch_bounds__(1024, 2) void  //
     const int32_t dst = dst_rows[i];
     if (dst < 0) continue;
     cub::StoreDirectBlockedVectorized(
-        tid, reinterpret_cast<uint16_t*>(params.gateup_input + static_cast<uint64_t>(dst) * params.hidden), out);
+        tid, reinterpret_cast<fp8x2_e4m3_t*>(params.gateup_input + static_cast<uint64_t>(dst) * params.hidden), out);
   }
 
   // 2) Scale bytes: distribute the kTopK experts across the group's threads

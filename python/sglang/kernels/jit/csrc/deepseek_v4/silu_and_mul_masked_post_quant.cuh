@@ -15,7 +15,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -136,8 +135,7 @@ silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t
   }();
 
   bf16x2_t gate[4], up[4];
-  // Toolkit CUB's vectorized blocked load does not take a pointer to const
-  auto* const input_pairs = const_cast<bf16x2_t*>(reinterpret_cast<const bf16x2_t*>(input));
+  const auto* const input_pairs = reinterpret_cast<const bf16x2_t*>(input);
   if constexpr (kSwizzle) {
     // gran=8 interleaved: every 16-element chunk on the N axis is
     // [gate[0..7], up[0..7]]. Each thread handles 8 consecutive output
@@ -181,18 +179,17 @@ silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t
   }
   const auto inv_scale = 1.0f / scale;
 
-  // CUB only vectorizes stores of builtin types, so store the fp8x2 bit patterns
-  uint16_t out[4];
+  fp8x2_e4m3_t out[4];
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
     const float scaled_val0 = results[2 * i + 0] * inv_scale;
     const float scaled_val1 = results[2 * i + 1] * inv_scale;
-    out[i] = std::bit_cast<uint16_t>(pack_fp8(scaled_val0, scaled_val1));
+    out[i] = pack_fp8(scaled_val0, scaled_val1);
   }
 
   PDLTriggerSecondary<kUsePDL>();
 
-  cub::StoreDirectBlockedVectorized(threadIdx.x, reinterpret_cast<uint16_t*>(output), out);
+  cub::StoreDirectBlockedVectorized(threadIdx.x, reinterpret_cast<fp8x2_e4m3_t*>(output), out);
   if constexpr (kTransposed) {
     *output_scale = ue8m0_exp;
   } else {
@@ -465,8 +462,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   PDLWaitPrimary<kUsePDL>();
 
   bf16x2_t gate[4], up[4];
-  // Toolkit CUB's vectorized blocked load does not take a pointer to const
-  auto* const input_pairs = const_cast<bf16x2_t*>(reinterpret_cast<const bf16x2_t*>(input));
+  const auto* const input_pairs = reinterpret_cast<const bf16x2_t*>(input);
   if constexpr (kSwizzle) {
     bf16x2_t gate_up[8];
     cub::LoadDirectBlockedVectorized(threadIdx.x, input_pairs, gate_up);
@@ -506,18 +502,17 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   }
   const auto inv_scale = 1.0f / scale;
 
-  // CUB only vectorizes stores of builtin types, so store the fp8x2 bit patterns
-  uint16_t out[4];
+  fp8x2_e4m3_t out[4];
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
     const float scaled_val0 = results[2 * i + 0] * inv_scale;
     const float scaled_val1 = results[2 * i + 1] * inv_scale;
-    out[i] = std::bit_cast<uint16_t>(pack_fp8(scaled_val0, scaled_val1));
+    out[i] = pack_fp8(scaled_val0, scaled_val1);
   }
 
   PDLTriggerSecondary<kUsePDL>();
 
-  cub::StoreDirectBlockedVectorized(threadIdx.x, reinterpret_cast<uint16_t*>(output), out);
+  cub::StoreDirectBlockedVectorized(threadIdx.x, reinterpret_cast<fp8x2_e4m3_t*>(output), out);
   if constexpr (kTransposed) {
     *output_scale = ue8m0_exp;
   } else {

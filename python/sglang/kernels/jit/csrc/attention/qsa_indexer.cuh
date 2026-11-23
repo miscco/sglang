@@ -153,16 +153,12 @@ SGL_DEVICE void qsa_gemma_norm_row(
     const T* __restrict__ x_row, const T* __restrict__ weight, const float eps, T* __restrict__ smem_row) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
-  // CUB vectorizes at most 4 items per access, so load T pairs to keep 16-byte accesses
-  using T2 = typename DTypeTrait<T>::packed_t;
-  using WarpLoad = cub::WarpLoad<T2, kPerLane / 2, cub::WARP_LOAD_VECTORIZE, kWarpThreads>;
+  using WarpLoad = cub::WarpLoad<T, kPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>;
   const uint32_t lane = threadIdx.x % kWarpThreads;
 
-  T2 xv2[kPerLane / 2], wv2[kPerLane / 2];
-  WarpLoad().Load(reinterpret_cast<const T2*>(x_row), xv2);
-  WarpLoad().Load(reinterpret_cast<const T2*>(weight), wv2);
-  const T* const xv = reinterpret_cast<const T*>(xv2);
-  const T* const wv = reinterpret_cast<const T*>(wv2);
+  T xv[kPerLane], wv[kPerLane];
+  WarpLoad().Load(x_row, xv);
+  WarpLoad().Load(weight, wv);
 
   float xf[kPerLane];
 #pragma unroll
@@ -261,14 +257,11 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
   // Raw token-K and RoPE coordinates are stored for every token, whether or
   // not the token completes a compression group.
   if (warp == 0) {
-    // A raw copy as 32-bit words: CUB only vectorizes stores of builtin types, and at most 4 items per access
-    constexpr int kWordsPerLane = kPerLane * sizeof(T) / sizeof(uint32_t);
-    uint32_t kv[kWordsPerLane];
-    cub::WarpLoad<uint32_t, kWordsPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
-        reinterpret_cast<const uint32_t*>(static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim),
-        kv);
-    cub::WarpStore<uint32_t, kWordsPerLane, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-        reinterpret_cast<uint32_t*>(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim), kv);
+    T kv[kPerLane];
+    cub::WarpLoad<T, kPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim, kv);
+    cub::WarpStore<T, kPerLane, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+        static_cast<T*>(params.key_state_buffer) + loc * kHeadDim, kv);
   }
   if (warp == 1 && lane < 3) {
     params.rope_position_buffer[loc * 3 + lane] = pos[lane];
@@ -302,9 +295,7 @@ __global__
 __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressParams __grid_constant__ params) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
-  // CUB vectorizes at most 4 items per access, so load T pairs to keep 16-byte accesses
-  using T2 = typename DTypeTrait<T>::packed_t;
-  using WarpLoad = cub::WarpLoad<T2, kPerLane / 2, cub::WARP_LOAD_VECTORIZE, kWarpThreads>;
+  using WarpLoad = cub::WarpLoad<T, kPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>;
   const uint32_t warp = threadIdx.x / kWarpThreads;
   const uint32_t lane = threadIdx.x % kWarpThreads;
   const uint32_t group = blockIdx.x * 4 + warp;
@@ -324,12 +315,8 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
   {
     float acc[kPerLane];
     for (int32_t r = 0; r < params.compress_ratio; ++r) {
-      T2 v2[kPerLane / 2];
-      WarpLoad().Load(
-          reinterpret_cast<const T2*>(
-              static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim),
-          v2);
-      const T* const v = reinterpret_cast<const T*>(v2);
+      T v[kPerLane];
+      WarpLoad().Load(static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim, v);
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i) {
         const float f = static_cast<float>(v[i]);

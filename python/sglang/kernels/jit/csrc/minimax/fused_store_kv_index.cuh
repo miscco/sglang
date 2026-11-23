@@ -66,9 +66,8 @@ struct StoreTrait {
     const auto src = pointer::offset(input_ptr, token_id * input_stride, head_id * kInHeadBytes);
     const auto dst = pointer::offset(cache_ptr, loc * cache_stride, head_id * kHeadBytes);
     PDLWaitPrimary<kUsePDL>();
-    // Toolkit CUB's vectorized blocked load does not take a pointer to const
     uint32_t chunk[kWordsPerThread];
-    cub::LoadDirectBlockedVectorized(lane, const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(src)), chunk);
+    cub::LoadDirectBlockedVectorized(lane, reinterpret_cast<const uint32_t*>(src), chunk);
     if constexpr (kCastFp8) {
 #ifdef USE_ROCM
       static_assert(!kCastFp8, "the bf16 -> fp8 cast store is CUDA-only");

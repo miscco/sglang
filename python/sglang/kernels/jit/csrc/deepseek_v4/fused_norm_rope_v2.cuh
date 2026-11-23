@@ -14,7 +14,6 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <bit>
 #include <cstdint>
 
 namespace sglang {
@@ -229,9 +228,9 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
                                    col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
       result.store(page_ptr + value_offset, 0);
     } else {
-      uint16_t result_bits[2] = {std::bit_cast<uint16_t>(result[0]), std::bit_cast<uint16_t>(result[1])};
-      cub::WarpStore<uint16_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-          reinterpret_cast<uint16_t*>(value_ptr), result_bits);
+      fp8x2_e4m3_t result_items[2] = {result[0], result[1]};
+      cub::WarpStore<fp8x2_e4m3_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+          reinterpret_cast<fp8x2_e4m3_t*>(value_ptr), result_items);
     }
     // The single fp32 scale is identical across all lanes -- write from any lane.
     if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
