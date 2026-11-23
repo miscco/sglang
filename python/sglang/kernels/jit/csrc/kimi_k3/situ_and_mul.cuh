@@ -17,6 +17,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <cuda/std/memory>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -370,7 +371,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   PDLWaitPrimary<kUsePDL>();
 
   bf16x2_t gate[4], up[4];
-  const auto* const input_pairs = reinterpret_cast<const bf16x2_t*>(input);
+  const auto* const input_pairs = cuda::std::assume_aligned<sizeof(gate)>(reinterpret_cast<const bf16x2_t*>(input));
   if constexpr (kSwizzle) {
     // gran=8 interleaved: every 16-element chunk on the N axis is
     // [gate[0..7], up[0..7]]. Each thread handles 8 consecutive output
@@ -424,7 +425,8 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
   PDLTriggerSecondary<kUsePDL>();
 
-  cub::StoreDirectBlockedVectorized(threadIdx.x, reinterpret_cast<fp8x2_e4m3_t*>(output), out);
+  cub::StoreDirectBlockedVectorized(
+      threadIdx.x, cuda::std::assume_aligned<sizeof(out)>(reinterpret_cast<fp8x2_e4m3_t*>(output)), out);
   if constexpr (kTransposed) {
     *output_scale = ue8m0_exp;
   } else {

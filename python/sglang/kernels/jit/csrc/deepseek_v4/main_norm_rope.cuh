@@ -13,6 +13,7 @@
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 #include <sgl_kernel/dsa/indexer_rope.cuh>
 
+#include <cuda/std/memory>
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
@@ -775,7 +776,8 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   // part 1: load (no norm). Each lane owns a 4-elem pack.
   {
     DType input[kVecSize];
-    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input_ptr, input);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(input)>(input_ptr), input);
     if (is_rope_lane) {
       if constexpr (kNeoxStyle) {
         dsa_indexer::load_neox_cos_sin<kRopeDim>(rope_cache, lane_id, freq, freq_sin);
@@ -861,7 +863,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     // q_fp8 row pointer: 128 fp8 / row, 4 per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
     cub::WarpStore<fp8x2_e4m3_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-        reinterpret_cast<fp8x2_e4m3_t*>(out_row), result);
+        cuda::std::assume_aligned<sizeof(result)>(reinterpret_cast<fp8x2_e4m3_t*>(out_row)), result);
     params.weights_out[work_id] = weight_val * params.weight_scale * scale;
   }
 }

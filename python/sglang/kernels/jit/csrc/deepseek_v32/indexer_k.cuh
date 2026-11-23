@@ -19,6 +19,7 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/dsa/indexer_rope.cuh>
 
+#include <cuda/std/memory>
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
@@ -93,9 +94,12 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   // part 1: LayerNorm
   {
     DType input[kVecSize];
-    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input_ptr, input);
-    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(params.weight, gamma);
-    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(params.bias, beta);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(input)>(input_ptr), input);
+    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(gamma)>(params.weight), gamma);
+    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(beta)>(params.bias), beta);
     if (is_rope_lane) {
       if constexpr (kNeoxStyle) {
         dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
@@ -153,7 +157,8 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     for (int i = 0; i < kVecSize; ++i)
       out[i] = cast<DType>(data[i]);
     auto out_row = static_cast<DType*>(params.k_out) + work_id * kHeadDim;
-    cub::WarpStore<DType, kVecSize, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(out_row, out);
+    cub::WarpStore<DType, kVecSize, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+        cuda::std::assume_aligned<sizeof(out)>(out_row), out);
   }
 }
 
@@ -280,9 +285,12 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   // part 1: LayerNorm
   {
     DType input[kVecSize];
-    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input_ptr, input);
-    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(params.weight, gamma);
-    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(params.bias, beta);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(input)>(input_ptr), input);
+    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(gamma)>(params.weight), gamma);
+    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(beta)>(params.bias), beta);
     if (is_rope_lane) {
       if constexpr (kNeoxStyle) {
         dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
@@ -359,7 +367,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   fp8x2_e4m3_t result[2] = {
       pack_fp8(data[0] * inv_scale, data[1] * inv_scale), pack_fp8(data[2] * inv_scale, data[3] * inv_scale)};
   cub::WarpStore<fp8x2_e4m3_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr), result);
+      cuda::std::assume_aligned<sizeof(result)>(reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)), result);
   if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
 }
 

@@ -12,6 +12,7 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
+#include <cuda/std/memory>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -115,9 +116,10 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   // part 1: norm
   {
     DType input_items[kVecSize], weight_items[kVecSize];
-    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input, input_items);
     cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
-        static_cast<const DType*>(params.weight), weight_items);
+        cuda::std::assume_aligned<sizeof(input_items)>(input), input_items);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(weight_items)>(static_cast<const DType*>(params.weight)), weight_items);
     if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
 
     float sum_of_squares = 0.0f;
@@ -230,7 +232,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     } else {
       fp8x2_e4m3_t result_items[2] = {result[0], result[1]};
       cub::WarpStore<fp8x2_e4m3_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-          reinterpret_cast<fp8x2_e4m3_t*>(value_ptr), result_items);
+          cuda::std::assume_aligned<sizeof(result_items)>(reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)), result_items);
     }
     // The single fp32 scale is identical across all lanes -- write from any lane.
     if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
@@ -282,9 +284,10 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 
   {
     DType input_items[kVecSize], weight_items[kVecSize];
-    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input, input_items);
     cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
-        static_cast<const DType*>(params.weight), weight_items);
+        cuda::std::assume_aligned<sizeof(input_items)>(input), input_items);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        cuda::std::assume_aligned<sizeof(weight_items)>(static_cast<const DType*>(params.weight)), weight_items);
     if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
 
     float sum_of_squares = 0.0f;
@@ -462,8 +465,9 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
     using BlockLoad = cub::BlockLoad<DType, kBlockSize, kVecSize, cub::BLOCK_LOAD_VECTORIZE>;
     DType input_items[kVecSize], weight_items[kVecSize];
-    BlockLoad().Load(input, input_items);
-    BlockLoad().Load(static_cast<const DType*>(params.weight), weight_items);
+    BlockLoad().Load(cuda::std::assume_aligned<sizeof(input_items)>(input), input_items);
+    BlockLoad().Load(
+        cuda::std::assume_aligned<sizeof(weight_items)>(static_cast<const DType*>(params.weight)), weight_items);
     if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
 
     float sum_of_squares = 0.0f;

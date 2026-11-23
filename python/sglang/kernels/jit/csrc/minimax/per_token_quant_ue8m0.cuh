@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <cuda/std/memory>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -55,7 +56,8 @@ __global__ __launch_bounds__(1024, 2) void  //
   const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
 
   bf16x2_t in[kVecElems / 2];
-  cub::LoadDirectBlockedVectorized(tid, reinterpret_cast<const bf16x2_t*>(token_in), in);
+  cub::LoadDirectBlockedVectorized(
+      tid, cuda::std::assume_aligned<sizeof(in)>(reinterpret_cast<const bf16x2_t*>(token_in)), in);
   float local_max = 0.0f;
   float vals[kVecElems];
 #pragma unroll
@@ -100,7 +102,10 @@ __global__ __launch_bounds__(1024, 2) void  //
     const int32_t dst = dst_rows[i];
     if (dst < 0) continue;
     cub::StoreDirectBlockedVectorized(
-        tid, reinterpret_cast<fp8x2_e4m3_t*>(params.gateup_input + static_cast<uint64_t>(dst) * params.hidden), out);
+        tid,
+        cuda::std::assume_aligned<sizeof(out)>(
+            reinterpret_cast<fp8x2_e4m3_t*>(params.gateup_input + static_cast<uint64_t>(dst) * params.hidden)),
+        out);
   }
 
   // 2) Scale bytes: distribute the kTopK experts across the group's threads

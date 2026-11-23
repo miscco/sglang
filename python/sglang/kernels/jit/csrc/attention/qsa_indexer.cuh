@@ -11,6 +11,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <cuda/std/memory>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -153,12 +154,13 @@ SGL_DEVICE void qsa_gemma_norm_row(
     const T* __restrict__ x_row, const T* __restrict__ weight, const float eps, T* __restrict__ smem_row) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
-  using WarpLoad = cub::WarpLoad<T, kPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>;
   const uint32_t lane = threadIdx.x % kWarpThreads;
 
+  // Load with the lane of threadIdx.x, as the norm below loads x_row again: loads of the same items only join for the
+  // same lane
   T xv[kPerLane], wv[kPerLane];
-  WarpLoad().Load(x_row, xv);
-  WarpLoad().Load(weight, wv);
+  cub::LoadDirectBlockedVectorized(lane, cuda::std::assume_aligned<sizeof(xv)>(x_row), xv);
+  cub::LoadDirectBlockedVectorized(lane, cuda::std::assume_aligned<sizeof(wv)>(weight), wv);
 
   float xf[kPerLane];
 #pragma unroll
@@ -258,10 +260,13 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
   // not the token completes a compression group.
   if (warp == 0) {
     T kv[kPerLane];
-    cub::WarpLoad<T, kPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
-        static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim, kv);
-    cub::WarpStore<T, kPerLane, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
-        static_cast<T*>(params.key_state_buffer) + loc * kHeadDim, kv);
+    cub::LoadDirectBlockedVectorized(
+        lane,
+        cuda::std::assume_aligned<sizeof(kv)>(
+            static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim),
+        kv);
+    cub::StoreDirectBlockedVectorized(
+        lane, cuda::std::assume_aligned<sizeof(kv)>(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim), kv);
   }
   if (warp == 1 && lane < 3) {
     params.rope_position_buffer[loc * 3 + lane] = pos[lane];
@@ -295,7 +300,6 @@ __global__
 __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressParams __grid_constant__ params) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
-  using WarpLoad = cub::WarpLoad<T, kPerLane, cub::WARP_LOAD_VECTORIZE, kWarpThreads>;
   const uint32_t warp = threadIdx.x / kWarpThreads;
   const uint32_t lane = threadIdx.x % kWarpThreads;
   const uint32_t group = blockIdx.x * 4 + warp;
@@ -316,7 +320,11 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     float acc[kPerLane];
     for (int32_t r = 0; r < params.compress_ratio; ++r) {
       T v[kPerLane];
-      WarpLoad().Load(static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim, v);
+      cub::LoadDirectBlockedVectorized(
+          lane,
+          cuda::std::assume_aligned<sizeof(v)>(
+              static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim),
+          v);
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i) {
         const float f = static_cast<float>(v[i]);

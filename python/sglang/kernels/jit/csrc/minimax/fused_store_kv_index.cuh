@@ -1,10 +1,11 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize/DType/Device
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil, pointer::offset
 
-#include <sgl_kernel/cub.cuh>    // For cub::LoadDirectBlockedVectorized, cub::StoreDirectBlockedVectorized
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
 
+#include <cuda/std/memory>  // For cub::LoadDirectBlockedVectorized, cub::StoreDirectBlockedVectorized
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -67,7 +68,8 @@ struct StoreTrait {
     const auto dst = pointer::offset(cache_ptr, loc * cache_stride, head_id * kHeadBytes);
     PDLWaitPrimary<kUsePDL>();
     uint32_t chunk[kWordsPerThread];
-    cub::LoadDirectBlockedVectorized(lane, reinterpret_cast<const uint32_t*>(src), chunk);
+    cub::LoadDirectBlockedVectorized(
+        lane, cuda::std::assume_aligned<sizeof(chunk)>(reinterpret_cast<const uint32_t*>(src)), chunk);
     if constexpr (kCastFp8) {
 #ifdef USE_ROCM
       static_assert(!kCastFp8, "the bf16 -> fp8 cast store is CUDA-only");
@@ -82,7 +84,8 @@ struct StoreTrait {
       reinterpret_cast<uint2*>(dst)[lane] = packed;
 #endif
     } else {
-      cub::StoreDirectBlockedVectorized(lane, reinterpret_cast<uint32_t*>(dst), chunk);
+      cub::StoreDirectBlockedVectorized(
+          lane, cuda::std::assume_aligned<sizeof(chunk)>(reinterpret_cast<uint32_t*>(dst)), chunk);
     }
     PDLTriggerSecondary<kUsePDL>();
   }

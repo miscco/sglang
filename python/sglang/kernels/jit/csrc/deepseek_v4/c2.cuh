@@ -12,6 +12,7 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
+#include <cuda/std/memory>
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
@@ -322,10 +323,11 @@ __global__ __launch_bounds__(kHeadDim / 2) void c2_prefill_store_kernel(
   const auto dst_row = rid * params.ring_size + pos % params.ring_size;
   if (out == 0) return;
   float buf[4];
-  cub::BlockLoad<float, kBlockThreads, 4, cub::BLOCK_LOAD_VECTORIZE>().Load(params.kv_input + row * kStride, buf);
+  cub::BlockLoad<float, kBlockThreads, 4, cub::BLOCK_LOAD_VECTORIZE>().Load(
+      cuda::std::assume_aligned<sizeof(buf)>(params.kv_input + row * kStride), buf);
   PDLTriggerSecondary<kUsePDL>();
   cub::BlockStore<float, kBlockThreads, 4, cub::BLOCK_STORE_VECTORIZE>().Store(
-      params.kv_state + dst_row * kStride, buf);
+      cuda::std::assume_aligned<sizeof(buf)>(params.kv_state + dst_row * kStride), buf);
 }
 
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
