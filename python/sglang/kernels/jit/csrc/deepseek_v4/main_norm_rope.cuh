@@ -12,11 +12,22 @@
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 #include <sgl_kernel/dsa/indexer_rope.cuh>
 
+#ifndef USE_ROCM
+#include <cub/warp/warp_load.cuh>
+#include <cub/warp/warp_store.cuh>
+#else
+#include <hipcub/hipcub.hpp>
+#endif
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
 #include <cstdint>
 #include <type_traits>
+
+#ifdef USE_ROCM
+namespace cub = hipcub;
+#endif
 
 namespace sglang {
 
@@ -743,9 +754,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
 
-  using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
-  using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;  // 4 fp8 / lane
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
@@ -775,8 +784,8 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   // part 1: load (no norm). Each lane owns a 4-elem pack.
   {
-    Storage input_vec;
-    input_vec.load(input_ptr, lane_id);
+    DType input[kVecSize];
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input_ptr, input);
     if (is_rope_lane) {
       if constexpr (kNeoxStyle) {
         dsa_indexer::load_neox_cos_sin<kRopeDim>(rope_cache, lane_id, freq, freq_sin);
@@ -788,7 +797,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     }
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      data[i] = cast<float>(input_vec[i]);
+      data[i] = cast<float>(input[i]);
     }
   }
 
@@ -855,13 +864,15 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     const auto abs_max = warp::reduce_max(local_max);
     const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
     const auto inv_scale = 1.0f / scale;
-    OutStorage result;
-    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
-    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+    // 4 fp8 / lane as two fp8x2 bit patterns
+    uint16_t result[2] = {
+        std::bit_cast<uint16_t>(pack_fp8(data[0] * inv_scale, data[1] * inv_scale)),
+        std::bit_cast<uint16_t>(pack_fp8(data[2] * inv_scale, data[3] * inv_scale))};
 
-    // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
+    // q_fp8 row pointer: 128 fp8 / row, 4 per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
-    result.store(out_row, lane_id);
+    cub::WarpStore<uint16_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+        reinterpret_cast<uint16_t*>(out_row), result);
     params.weights_out[work_id] = weight_val * params.weight_scale * scale;
   }
 }
