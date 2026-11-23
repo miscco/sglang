@@ -12,6 +12,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
+
+#ifndef USE_ROCM
+#include <cub/block/block_load.cuh>
+#include <cub/block/block_store.cuh>
+#include <cuda/std/memory>
+#endif
 
 namespace sglang {
 
@@ -86,10 +93,23 @@ struct AlignedVector {
  public:
   /// \brief Vectorized load from `ptr` at the given element `offset`.
   SGL_DEVICE void load(const void* ptr, int64_t offset = 0) {
+#ifndef USE_ROCM
+    if constexpr (kCubVectorizes) {
+      cub::LoadDirectBlockedVectorized(0, vector_ptr(static_cast<const element_t*>(ptr), offset), m_storage.data);
+      return;
+    }
+#endif
     m_storage = reinterpret_cast<const storage_t*>(ptr)[offset];
   }
   /// \brief Vectorized store to `ptr` at the given element `offset`.
   SGL_DEVICE void store(void* ptr, int64_t offset = 0) const {
+#ifndef USE_ROCM
+    if constexpr (kCubVectorizes) {
+      storage_t storage = m_storage;
+      cub::StoreDirectBlockedVectorized(0, vector_ptr(static_cast<element_t*>(ptr), offset), storage.data);
+      return;
+    }
+#endif
     reinterpret_cast<storage_t*>(ptr)[offset] = m_storage;
   }
   /// \brief Fill all N elements with the same `value`.
@@ -115,6 +135,20 @@ struct AlignedVector {
   }
 
  private:
+#ifndef USE_ROCM
+  /// \brief CUB accesses vectors of at least 4 bytes as a whole, narrower ones item by item.
+  static constexpr bool kCubVectorizes = sizeof(storage_t) >= 4;
+
+  /// \brief The vector at `offset` of `ptr`, which `load` and `store` access as a `storage_t`, thus require to be
+  /// aligned to its size.
+  template <typename E>
+  SGL_DEVICE static auto vector_ptr(E* ptr, int64_t offset) -> E* {
+    using vector_t = std::conditional_t<std::is_const_v<E>, const storage_t, storage_t>;
+    return reinterpret_cast<E*>(
+        cuda::std::assume_aligned<sizeof(storage_t)>(reinterpret_cast<vector_t*>(ptr) + offset));
+  }
+#endif
+
   storage_t m_storage;
 };
 
