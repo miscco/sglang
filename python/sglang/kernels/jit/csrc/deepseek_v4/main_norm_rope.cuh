@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
@@ -12,22 +13,11 @@
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 #include <sgl_kernel/dsa/indexer_rope.cuh>
 
-#ifndef USE_ROCM
-#include <cub/warp/warp_load.cuh>
-#include <cub/warp/warp_store.cuh>
-#else
-#include <hipcub/hipcub.hpp>
-#endif
-
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
 #include <cstdint>
 #include <type_traits>
-
-#ifdef USE_ROCM
-namespace cub = hipcub;
-#endif
 
 namespace sglang {
 

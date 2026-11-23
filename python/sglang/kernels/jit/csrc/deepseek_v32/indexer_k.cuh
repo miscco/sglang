@@ -8,6 +8,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
@@ -18,21 +19,10 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/dsa/indexer_rope.cuh>
 
-#ifndef USE_ROCM
-#include <cub/warp/warp_load.cuh>
-#include <cub/warp/warp_store.cuh>
-#else
-#include <hipcub/hipcub.hpp>
-#endif
-
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
 #include <cstdint>
-
-#ifdef USE_ROCM
-namespace cub = hipcub;
-#endif
 
 namespace sglang {
 
@@ -83,7 +73,6 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
 
-  using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
 
   const auto warp_id = threadIdx.x / kWarpThreads;
@@ -98,14 +87,15 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq, freq_sin, gamma, beta;
+  Float4 data, freq, freq_sin;
+  float gamma[kVecSize], beta[kVecSize];
 
   // part 1: LayerNorm
   {
-    Storage input_vec;
-    input_vec.load(input_ptr, lane_id);
-    gamma.load(params.weight, lane_id);
-    beta.load(params.bias, lane_id);
+    DType input[kVecSize];
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input_ptr, input);
+    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(params.weight, gamma);
+    cub::WarpLoad<float, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(params.bias, beta);
     if (is_rope_lane) {
       if constexpr (kNeoxStyle) {
         dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
@@ -117,7 +107,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     float sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      data[i] = cast<float>(input_vec[i]);
+      data[i] = cast<float>(input[i]);
       sum += data[i];
     }
     const float mean = warp::reduce_sum(sum) / kHeadDim;
@@ -158,12 +148,14 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   if constexpr (kHadamard) dsa_indexer::hadamard_128(data, lane_id);
 
   {
-    Storage out_vec;
+    // CUB only vectorizes stores of builtin types, so store the DType bit patterns
+    uint16_t out[kVecSize];
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i)
-      out_vec[i] = cast<DType>(data[i]);
+      out[i] = std::bit_cast<uint16_t>(cast<DType>(data[i]));
     auto out_row = static_cast<DType*>(params.k_out) + work_id * kHeadDim;
-    out_vec.store(out_row, lane_id);
+    cub::WarpStore<uint16_t, kVecSize, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+        reinterpret_cast<uint16_t*>(out_row), out);
   }
 }
 

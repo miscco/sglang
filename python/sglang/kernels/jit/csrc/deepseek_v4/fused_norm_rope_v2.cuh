@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -13,6 +14,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <bit>
 #include <cstdint>
 
 namespace sglang {
@@ -80,7 +82,6 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
-  using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
 
   const auto warp_id = threadIdx.x / kWarpThreads;
@@ -114,15 +115,16 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 
   // part 1: norm
   {
-    Storage input_vec, weight_vec;
-    input_vec.load(input, lane_id);
-    weight_vec.load(params.weight, lane_id);
+    DType input_items[kVecSize], weight_items[kVecSize];
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input, input_items);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        static_cast<const DType*>(params.weight), weight_items);
     if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
 
     float sum_of_squares = 0.0f;
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
+      const auto fp32_input = cast<float>(input_items[i]);
       sum_of_squares += fp32_input * fp32_input;
     }
 
@@ -131,8 +133,8 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
-      const auto fp32_weight = cast<float>(weight_vec[i]);
+      const auto fp32_input = cast<float>(input_items[i]);
+      const auto fp32_weight = cast<float>(weight_items[i]);
       data[i] = fp32_input * norm_factor * fp32_weight;
     }
   }
@@ -227,7 +229,9 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
                                    col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
       result.store(page_ptr + value_offset, 0);
     } else {
-      result.store(value_ptr, lane_id);
+      uint16_t result_bits[2] = {std::bit_cast<uint16_t>(result[0]), std::bit_cast<uint16_t>(result[1])};
+      cub::WarpStore<uint16_t, 2, cub::WARP_STORE_VECTORIZE, kWarpThreads>().Store(
+          reinterpret_cast<uint16_t*>(value_ptr), result_bits);
     }
     // The single fp32 scale is identical across all lanes -- write from any lane.
     if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
@@ -247,7 +251,6 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
-  using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
 
   const auto warp_id = threadIdx.x / kWarpThreads;
@@ -279,15 +282,16 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   Float4 data, freq;
 
   {
-    Storage input_vec, weight_vec;
-    input_vec.load(input, lane_id);
-    weight_vec.load(params.weight, lane_id);
+    DType input_items[kVecSize], weight_items[kVecSize];
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(input, input_items);
+    cub::WarpLoad<DType, kVecSize, cub::WARP_LOAD_VECTORIZE, kWarpThreads>().Load(
+        static_cast<const DType*>(params.weight), weight_items);
     if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
 
     float sum_of_squares = 0.0f;
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
+      const auto fp32_input = cast<float>(input_items[i]);
       sum_of_squares += fp32_input * fp32_input;
     }
 
@@ -296,8 +300,8 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
-      const auto fp32_weight = cast<float>(weight_vec[i]);
+      const auto fp32_input = cast<float>(input_items[i]);
+      const auto fp32_weight = cast<float>(weight_items[i]);
       data[i] = fp32_input * norm_factor * fp32_weight;
     }
   }
@@ -422,7 +426,6 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
-  using Storage = AlignedVector<DType, kVecSize>;
   using Float2 = AlignedVector<float, kVecSize>;
 
   const auto tx = threadIdx.x;
@@ -458,15 +461,16 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   {
     __shared__ float partial_sums[kNumWarps];
 
-    Storage input_vec, weight_vec;
-    input_vec.load(input, tx);
-    weight_vec.load(params.weight, tx);
+    using BlockLoad = cub::BlockLoad<DType, kBlockSize, kVecSize, cub::BLOCK_LOAD_VECTORIZE>;
+    DType input_items[kVecSize], weight_items[kVecSize];
+    BlockLoad().Load(input, input_items);
+    BlockLoad().Load(static_cast<const DType*>(params.weight), weight_items);
     if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
 
     float sum_of_squares = 0.0f;
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
+      const auto fp32_input = cast<float>(input_items[i]);
       sum_of_squares += fp32_input * fp32_input;
     }
 
@@ -480,8 +484,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
-      const auto fp32_weight = cast<float>(weight_vec[i]);
+      const auto fp32_input = cast<float>(input_items[i]);
+      const auto fp32_weight = cast<float>(weight_items[i]);
       data[i] = fp32_input * norm_factor * fp32_weight;
     }
   }

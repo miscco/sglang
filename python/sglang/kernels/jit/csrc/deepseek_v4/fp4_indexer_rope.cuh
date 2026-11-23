@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
@@ -186,7 +187,6 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   static_assert(kScaleBytes == 4, "the four block exponents are packed into one uint32 store");
   static_assert(std::has_single_bit(kRatio), "group_pos is derived by masking, so the ratio must be a power of two");
 
-  using bf16_vec_t = AlignedVector<bf16x2_t, 1>;
   using fp32_vec_t = AlignedVector<float, 2>;
 
   const auto lane = threadIdx.x % kWarpThreads;
@@ -200,22 +200,21 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   const auto position = static_cast<int64_t>(static_cast<const PosT*>(params.positions)[row]);
   PDLWaitPrimary<kUsePDL>();
 
-  bf16_vec_t head_in, tail_in, head_w, tail_w;
-  head_in.load(params.input + row * kHeadDim, lane);
-  tail_in.load(params.input + row * kHeadDim, lane + kWarpThreads);
-  head_w.load(params.norm_weight, lane);
-  tail_w.load(params.norm_weight, lane + kWarpThreads);
+  // The head and tail pair of a lane, striped over the bf16x2 pairs of the row
+  bf16x2_t in[2], w[2];
+  cub::LoadDirectStriped<kWarpThreads>(lane, reinterpret_cast<const bf16x2_t*>(params.input + row * kHeadDim), in);
+  cub::LoadDirectStriped<kWarpThreads>(lane, reinterpret_cast<const bf16x2_t*>(params.norm_weight), w);
   fp32_vec_t freq;
   freq.load(params.freqs_cis + (position & ~static_cast<int64_t>(kRatio - 1)) * kRopeDim, lane);
 
   fp32x2_t head, tail;
   {
-    const auto [h0, h1] = cast<fp32x2_t>(head_in[0]);
-    const auto [t0, t1] = cast<fp32x2_t>(tail_in[0]);
+    const auto [h0, h1] = cast<fp32x2_t>(in[0]);
+    const auto [t0, t1] = cast<fp32x2_t>(in[1]);
     const auto sqrsum = warp::reduce_sum(h0 * h0 + h1 * h1 + t0 * t0 + t1 * t1);
     const auto inv_rms = math::rsqrt(sqrsum * (1.0f / static_cast<float>(kHeadDim)) + params.eps);
-    const auto [wh0, wh1] = cast<fp32x2_t>(head_w[0]);
-    const auto [wt0, wt1] = cast<fp32x2_t>(tail_w[0]);
+    const auto [wh0, wh1] = cast<fp32x2_t>(w[0]);
+    const auto [wt0, wt1] = cast<fp32x2_t>(w[1]);
     // `k_norm` materializes a bf16 tensor, so the norm result is rounded before
     // anything downstream sees it -- the RoPE below included.
     head = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{wh0 * (h0 * inv_rms), wh1 * (h1 * inv_rms)}));
@@ -235,8 +234,8 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   // Byte i of the payload covers elements (2i, 2i+1), so a lane's head pair is
   // byte `lane` and its tail pair byte `lane + 32`: two coalesced 32-byte runs.
   const auto payload_ptr = page_ptr + slot * kPayloadBytes;
-  payload_ptr[lane] = static_cast<uint8_t>(packed.payload[0]);
-  payload_ptr[lane + kWarpThreads] = static_cast<uint8_t>(packed.payload[1]);
+  uint8_t payload[2] = {static_cast<uint8_t>(packed.payload[0]), static_cast<uint8_t>(packed.payload[1])};
+  cub::StoreDirectStriped<kWarpThreads>(lane, payload_ptr, payload);
 
   if (lane == 0) {
     *reinterpret_cast<uint32_t*>(page_ptr + kPageSize * kPayloadBytes + slot * kScaleBytes) = scale_word;
@@ -258,7 +257,6 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
       "the one-warp tiling is specific to a 128-wide row whose second half is the RoPE tail");
   static_assert(kHeadDim == 2 * kWarpThreads * 2, "a lane owns one bf16x2 of each half");
 
-  using bf16_vec_t = AlignedVector<bf16x2_t, 1>;
   using fp32_vec_t = AlignedVector<float, 2>;
 
   const auto lane = threadIdx.x % kWarpThreads;
@@ -270,19 +268,18 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   const auto position = static_cast<int64_t>(static_cast<const PosT*>(params.positions)[row / params.heads]);
   PDLWaitPrimary<kUsePDL>();
 
-  bf16_vec_t head_in, tail_in;
-  head_in.load(params.input + row * kHeadDim, lane);
-  tail_in.load(params.input + row * kHeadDim, lane + kWarpThreads);
+  // The head and tail pair of a lane, striped over the bf16x2 pairs of the row
+  bf16x2_t in[2];
+  cub::LoadDirectStriped<kWarpThreads>(lane, reinterpret_cast<const bf16x2_t*>(params.input + row * kHeadDim), in);
   fp32_vec_t freq;
   freq.load(params.freqs_cis + position * kRopeDim, lane);
 
-  const auto packed =
-      index_rope_quant_pack(cast<fp32x2_t>(head_in[0]), cast<fp32x2_t>(tail_in[0]), fp32x2_t{freq[0], freq[1]});
+  const auto packed = index_rope_quant_pack(cast<fp32x2_t>(in[0]), cast<fp32x2_t>(in[1]), fp32x2_t{freq[0], freq[1]});
   const auto scale_word = index_scale_word(packed.exponent);
 
   const auto payload_ptr = params.payload + row * kPayloadBytes;
-  payload_ptr[lane] = static_cast<int8_t>(packed.payload[0]);
-  payload_ptr[lane + kWarpThreads] = static_cast<int8_t>(packed.payload[1]);
+  int8_t payload[2] = {static_cast<int8_t>(packed.payload[0]), static_cast<int8_t>(packed.payload[1])};
+  cub::StoreDirectStriped<kWarpThreads>(lane, payload_ptr, payload);
 
   if (lane == 0) params.scale[row] = static_cast<int32_t>(scale_word);
 

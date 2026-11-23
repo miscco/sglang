@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -12,6 +13,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <bit>
 #include <cstdint>
 
 namespace sglang {
@@ -46,8 +48,6 @@ __global__ __launch_bounds__(1024, 2) void  //
   static_assert(kGroupSize % kVecElems == 0, "group_size must be a multiple of 8");
   static_assert(kTopK <= kWarpThreads, "kTopK must fit in a warp for the lane-parallel scale write");
   constexpr uint32_t kThreadsPerGroup = kGroupSize / kVecElems;
-  using InputVec = AlignedVector<bf16x2_t, kVecElems / 2>;
-  using OutputVec = AlignedVector<fp8x2_e4m3_t, kVecElems / 2>;
 
   const uint32_t token_id = blockIdx.x;
   const uint32_t tid = threadIdx.x;
@@ -55,13 +55,14 @@ __global__ __launch_bounds__(1024, 2) void  //
 
   const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
 
-  InputVec in_vec;
-  in_vec.load(token_in, tid);
+  // Toolkit CUB's vectorized blocked load does not take a pointer to const
+  bf16x2_t in[kVecElems / 2];
+  cub::LoadDirectBlockedVectorized(tid, const_cast<bf16x2_t*>(reinterpret_cast<const bf16x2_t*>(token_in)), in);
   float local_max = 0.0f;
   float vals[kVecElems];
 #pragma unroll
   for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-    const auto [v0, v1] = cast<fp32x2_t>(in_vec[i]);
+    const auto [v0, v1] = cast<fp32x2_t>(in[i]);
     vals[2 * i + 0] = v0;
     vals[2 * i + 1] = v1;
     local_max = fmaxf(local_max, fmaxf(fabsf(v0), fabsf(v1)));
@@ -74,10 +75,11 @@ __global__ __launch_bounds__(1024, 2) void  //
   const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
   const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
 
-  OutputVec out_vec;
+  // CUB only vectorizes stores of builtin types, so store the fp8x2 bit patterns
+  uint16_t out[kVecElems / 2];
 #pragma unroll
   for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-    out_vec[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
+    out[i] = std::bit_cast<uint16_t>(pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale));
   }
 
   // Read this token's kTopK destinations once (fully unrolled).
@@ -100,7 +102,8 @@ __global__ __launch_bounds__(1024, 2) void  //
   for (uint32_t i = 0; i < kTopK; ++i) {
     const int32_t dst = dst_rows[i];
     if (dst < 0) continue;
-    out_vec.store(params.gateup_input + static_cast<uint64_t>(dst) * params.hidden, tid);
+    cub::StoreDirectBlockedVectorized(
+        tid, reinterpret_cast<uint16_t*>(params.gateup_input + static_cast<uint64_t>(dst) * params.hidden), out);
   }
 
   // 2) Scale bytes: distribute the kTopK experts across the group's threads

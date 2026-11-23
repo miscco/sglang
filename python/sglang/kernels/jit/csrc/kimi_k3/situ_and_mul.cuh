@@ -7,6 +7,7 @@
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
 #include <sgl_kernel/activation.cuh>
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
@@ -18,6 +19,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -334,8 +336,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   constexpr uint32_t kGroupSize = 128u;
   constexpr uint32_t kWorkThreads = 16u;
   // each thread will handle 8 elements
-  using InputVec = AlignedVector<bf16x2_t, 4>;
-  using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
   static_assert(8 * kWorkThreads == 128, "Invalid tiling");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
@@ -370,17 +370,24 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
   PDLWaitPrimary<kUsePDL>();
 
-  InputVec gate_vec, up_vec;
+  bf16x2_t gate[4], up[4];
+  // Toolkit CUB's vectorized blocked load does not take a pointer to const
+  auto* const input_pairs = const_cast<bf16x2_t*>(reinterpret_cast<const bf16x2_t*>(input));
   if constexpr (kSwizzle) {
     // gran=8 interleaved: every 16-element chunk on the N axis is
     // [gate[0..7], up[0..7]]. Each thread handles 8 consecutive output
     // elements, so its gate chunk lives at vec index 2*threadIdx.x and its
     // up chunk at 2*threadIdx.x+1.
-    gate_vec.load(input, threadIdx.x * 2);
-    up_vec.load(input, threadIdx.x * 2 + 1);
+    bf16x2_t gate_up[8];
+    cub::LoadDirectBlockedVectorized(threadIdx.x, input_pairs, gate_up);
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      gate[i] = gate_up[i];
+      up[i] = gate_up[4 + i];
+    }
   } else {
-    gate_vec.load(input, threadIdx.x);
-    up_vec.load(input, threadIdx.x + blockDim.x);
+    cub::LoadDirectBlockedVectorized(threadIdx.x, input_pairs, gate);
+    cub::LoadDirectBlockedVectorized(threadIdx.x, input_pairs + 4 * blockDim.x, up);
   }
 
   float local_max = 0.0f;
@@ -388,7 +395,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = situ_and_mul(gate_vec[i], up_vec[i], beta, inv_beta, linear_beta, inv_linear_beta);
+    const auto [x, y] = situ_and_mul(gate[i], up[i], beta, inv_beta, linear_beta, inv_linear_beta);
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
@@ -409,17 +416,18 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   }
   const auto inv_scale = 1.0f / scale;
 
-  OutputVec out_vec;
+  // CUB only vectorizes stores of builtin types, so store the fp8x2 bit patterns
+  uint16_t out[4];
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
     const float scaled_val0 = results[2 * i + 0] * inv_scale;
     const float scaled_val1 = results[2 * i + 1] * inv_scale;
-    out_vec[i] = pack_fp8(scaled_val0, scaled_val1);
+    out[i] = std::bit_cast<uint16_t>(pack_fp8(scaled_val0, scaled_val1));
   }
 
   PDLTriggerSecondary<kUsePDL>();
 
-  out_vec.store(output, threadIdx.x);
+  cub::StoreDirectBlockedVectorized(threadIdx.x, reinterpret_cast<uint16_t*>(output), out);
   if constexpr (kTransposed) {
     *output_scale = ue8m0_exp;
   } else {

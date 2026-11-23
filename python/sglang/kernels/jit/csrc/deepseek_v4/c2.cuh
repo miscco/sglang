@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/cub.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -305,8 +306,8 @@ __global__ __launch_bounds__(kHeadDim / 2) void c2_prefill_store_kernel(
     const int32_t* __restrict__ extend_seq_lens) {
   using namespace device;
   constexpr int64_t kStride = kHeadDim * 2;
-  using vec_t = AlignedVector<float, 4>;
-  static_assert(kStride == 4 * (kHeadDim / 2));
+  constexpr int kBlockThreads = kHeadDim / 2;
+  static_assert(kStride == 4 * kBlockThreads);
 
   // The pooling kernel reads the ring rows this one overwrites.
   PDLWaitPrimary<kUsePDL>();
@@ -320,10 +321,11 @@ __global__ __launch_bounds__(kHeadDim / 2) void c2_prefill_store_kernel(
   const auto pos = static_cast<uint32_t>(static_cast<const PosT*>(params.positions)[row]);
   const auto dst_row = rid * params.ring_size + pos % params.ring_size;
   if (out == 0) return;
-  vec_t buf;
-  buf.load(params.kv_input + row * kStride, threadIdx.x);
+  float buf[4];
+  cub::BlockLoad<float, kBlockThreads, 4, cub::BLOCK_LOAD_VECTORIZE>().Load(params.kv_input + row * kStride, buf);
   PDLTriggerSecondary<kUsePDL>();
-  buf.store(params.kv_state + dst_row * kStride, threadIdx.x);
+  cub::BlockStore<float, kBlockThreads, 4, cub::BLOCK_STORE_VECTORIZE>().Store(
+      params.kv_state + dst_row * kStride, buf);
 }
 
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>

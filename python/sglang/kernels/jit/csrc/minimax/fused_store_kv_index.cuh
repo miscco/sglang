@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize/DType/Device
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil, pointer::offset
 
+#include <sgl_kernel/cub.cuh>    // For cub::LoadDirectBlockedVectorized, cub::StoreDirectBlockedVectorized
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
 
@@ -26,7 +27,7 @@ struct StoreKVIndexParams {
 template <int64_t kHeadBytes, bool kCastFp8, bool kUsePDL>
 struct StoreTrait {
   static_assert(kHeadBytes % 16 == 0, "head bytes must be a multiple of 16 (128-bit vector)");
-  using vec_t = device::AlignedVector<uint32_t, 4>;  // 16 bytes / thread
+  static constexpr int kWordsPerThread = 4;  // 16 bytes / thread
   static constexpr int64_t kInHeadBytes = kCastFp8 ? 2 * kHeadBytes : kHeadBytes;
   static constexpr uint32_t kWorkerSize = kInHeadBytes / 16;  // threads per head
 
@@ -65,8 +66,9 @@ struct StoreTrait {
     const auto src = pointer::offset(input_ptr, token_id * input_stride, head_id * kInHeadBytes);
     const auto dst = pointer::offset(cache_ptr, loc * cache_stride, head_id * kHeadBytes);
     PDLWaitPrimary<kUsePDL>();
-    vec_t chunk;
-    chunk.load(src, lane);
+    // Toolkit CUB's vectorized blocked load does not take a pointer to const
+    uint32_t chunk[kWordsPerThread];
+    cub::LoadDirectBlockedVectorized(lane, const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(src)), chunk);
     if constexpr (kCastFp8) {
 #ifdef USE_ROCM
       static_assert(!kCastFp8, "the bf16 -> fp8 cast store is CUDA-only");
@@ -81,7 +83,7 @@ struct StoreTrait {
       reinterpret_cast<uint2*>(dst)[lane] = packed;
 #endif
     } else {
-      chunk.store(dst, lane);
+      cub::StoreDirectBlockedVectorized(lane, reinterpret_cast<uint32_t*>(dst), chunk);
     }
     PDLTriggerSecondary<kUsePDL>();
   }
